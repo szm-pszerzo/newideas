@@ -6,6 +6,7 @@ pattern features + memory-safe RandomForest + heuristics.
 
 Input : rawdata.csv  (columns: oe, gyto, tcs) — in same folder
 Output: predicted_tcs.csv (adds tcs_pred, tcs_top3, confidence)
+Also writes artifacts to ./tcs_artifacts for inference.
 """
 
 from pathlib import Path
@@ -21,10 +22,13 @@ from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
 )
+import joblib
 
 # --------------------------- Config ---------------------------
 INPUT_FILE   = Path("rawdata.csv")
 OUTPUT_FILE  = Path("predicted_tcs.csv")
+ARTIFACTS_DIR = Path("tcs_artifacts")
+
 RANDOM_STATE = 42
 TEST_SIZE    = 0.2
 
@@ -44,7 +48,6 @@ TOPK_PREFIX2 = 200
 TOPK_PREFIX3 = 300
 TOPK_SUFFIX2 = 200
 TOPK_SUFFIX3 = 300
-
 
 # --------------------------- Helpers ---------------------------
 def extract_features(oe: str) -> pd.Series:
@@ -66,13 +69,11 @@ def extract_features(oe: str) -> pd.Series:
         "suffix3": oe[-3:],
     })
 
-
 def cap_by_frequency(s: pd.Series, top_k: int, other_token: str = "_OTHER_") -> pd.Series:
     """Keep top_k frequent tokens, map the rest to OTHER (controls feature cardinality)."""
     vc = s.value_counts(dropna=False)
     keep = set(vc.head(top_k).index)
     return s.where(s.isin(keep), other_token)
-
 
 def heuristic_guess(oe: str, gyto: str):
     """Return a heuristic tcs if pattern detected, else None."""
@@ -88,9 +89,7 @@ def heuristic_guess(oe: str, gyto: str):
         return "Lighting"
     if "BOSCH" in gyto_u and re.search(r"\d{3,}", oe_u):
         return "Electrical"
-
     return None
-
 
 # --------------------------- Load & Clean ---------------------------
 print("🔹 Loading data…")
@@ -110,23 +109,29 @@ df_all["gyto"] = df_all["gyto"].astype(str).str.upper().str.strip()
 
 print(f"✅ Loaded {len(df_all)} rows.")
 
-
-# --------------------------- Feature Engineering (on ALL rows) ---------------------------
+# --------------------------- Feature Engineering (ALL rows) ---------------------------
 print("🔹 Extracting OE features…")
 feat_all = df_all["oe"].apply(extract_features)
 df_all = pd.concat([df_all, feat_all], axis=1)
 
-# Cap high-cardinality string fragments BEFORE encoding
+# Cap high-cardinality string fragments BEFORE encoding (ensures '_OTHER_' exists)
 df_all["prefix2"] = cap_by_frequency(df_all["prefix2"].astype(str), TOPK_PREFIX2)
 df_all["prefix3"] = cap_by_frequency(df_all["prefix3"].astype(str), TOPK_PREFIX3)
 df_all["suffix2"] = cap_by_frequency(df_all["suffix2"].astype(str), TOPK_SUFFIX2)
 df_all["suffix3"] = cap_by_frequency(df_all["suffix3"].astype(str), TOPK_SUFFIX3)
 
-# Encode fragments and manufacturer (fit on ALL rows so we can predict for all rows later)
-for col in ["prefix2", "prefix3", "suffix2", "suffix3"]:
-    le_col = LabelEncoder()
-    df_all[col] = le_col.fit_transform(df_all[col].astype(str))
+# --- Fit & STORE each fragment encoder explicitly ---
+prefix2_encoder = LabelEncoder()
+prefix3_encoder = LabelEncoder()
+suffix2_encoder = LabelEncoder()
+suffix3_encoder = LabelEncoder()
 
+df_all["prefix2"] = prefix2_encoder.fit_transform(df_all["prefix2"].astype(str))
+df_all["prefix3"] = prefix3_encoder.fit_transform(df_all["prefix3"].astype(str))
+df_all["suffix2"] = suffix2_encoder.fit_transform(df_all["suffix2"].astype(str))
+df_all["suffix3"] = suffix3_encoder.fit_transform(df_all["suffix3"].astype(str))
+
+# Manufacturer encoder (store it too)
 le_gyto = LabelEncoder()
 df_all["gyto_enc"] = le_gyto.fit_transform(df_all["gyto"].astype(str))
 
@@ -175,7 +180,6 @@ X_tr, X_te, y_tr, y_te = train_test_split(
 print(f"🧮 Train shape: {X_tr.shape}, Test shape: {X_te.shape}")
 print(f"   Train mem ~ {X_tr.nbytes/1e6:.1f} MB, Test mem ~ {X_te.nbytes/1e6:.1f} MB")
 
-
 # --------------------------- Train Model (RandomForest) ---------------------------
 print("🔹 Training RandomForest (memory-safe settings)…")
 model = RandomForestClassifier(**RF_PARAMS)
@@ -185,10 +189,10 @@ y_pred = model.predict(X_te)
 acc = accuracy_score(y_te, y_pred)
 print(f"✅ Accuracy: {acc:.2%}")
 
-# ---- FIX: match labels to what's actually present in y_te ∪ y_pred ----
+# Match labels to what's present in y_te ∪ y_pred
 labels_eval = np.union1d(y_te, y_pred)
 target_names_eval = le_tcs.inverse_transform(labels_eval)
-print("🔹 Classification report (only for labels present in test/pred):")
+print("🔹 Classification report (only labels present in test/pred):")
 print(classification_report(
     y_te, y_pred,
     labels=labels_eval,
@@ -196,45 +200,81 @@ print(classification_report(
     zero_division=0
 ))
 
-# Also print aggregate metrics
-p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(y_te, y_pred, average="macro", zero_division=0)
-p_w, r_w, f1_w, _ = precision_recall_fscore_support(y_te, y_pred, average="weighted", zero_division=0)
+# Aggregate metrics
+p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
+    y_te, y_pred, average="macro", zero_division=0
+)
+p_w, r_w, f1_w, _ = precision_recall_fscore_support(
+    y_te, y_pred, average="weighted", zero_division=0
+)
 print(f"📊 Macro F1: {f1_macro:.4f} | Weighted F1: {f1_w:.4f}")
 
+# # --------------------------- Predict ALL rows (optional output) ---------------------------
+# print("🔹 Generating predictions for all rows (heuristics + model)…")
+# def row_vector(row) -> np.ndarray:
+#     return row[feature_cols].astype(np.float32).to_numpy().reshape(1, -1)
+#
+# tcs_pred = []
+# tcs_top3 = []
+# confidence = []
+#
+# for _, row in df_all.iterrows():
+#     # Heuristic first
+#     h = heuristic_guess(row["oe"], row["gyto"])
+#     if h is not None:
+#         tcs_pred.append(h)
+#         tcs_top3.append(h)
+#         confidence.append(1.0)
+#         continue
+#
+#     # Model path
+#     x = row_vector(row)
+#     probs = model.predict_proba(x)[0]
+#     idx = np.argsort(probs)[::-1][:3]
+#     labels = le_tcs.inverse_transform(idx)
+#     tcs_pred.append(labels[0])
+#     tcs_top3.append(", ".join(labels))
+#     confidence.append(float(probs[idx[0]]))
+#
+# df_out = df_all.copy()
+# df_out["tcs_pred"] = tcs_pred
+# df_out["tcs_top3"] = tcs_top3
+# df_out["confidence"] = confidence
+#
+# print("🔹 Saving results CSV…")
+# df_out.to_csv(OUTPUT_FILE, index=False)
+# print(f"🎉 Wrote predictions: {OUTPUT_FILE.resolve()}")
 
-# --------------------------- Predict for ALL Rows ---------------------------
-print("🔹 Generating predictions for all rows (heuristics + model)…")
-def row_vector(row) -> np.ndarray:
-    return row[feature_cols].astype(np.float32).to_numpy().reshape(1, -1)
+# --------------------------- Export artifacts for inference ---------------------------
+print("🔹 Saving artifacts for inference…")
+ARTIFACTS_DIR.mkdir(exist_ok=True)
 
-tcs_pred = []
-tcs_top3 = []
-confidence = []
+# Fallback for unseen GYTO at inference: training mode (most frequent)
+try:
+    gyto_fallback = df_all.assign(_gyto_raw=le_gyto.inverse_transform(df_all["gyto_enc"]))["_gyto_raw"].mode()[0]
+except Exception:
+    gyto_fallback = le_gyto.classes_[0] if hasattr(le_gyto, "classes_") else None
 
-for _, row in df_all.iterrows():
-    # Heuristic first
-    h = heuristic_guess(row["oe"], row["gyto"])
-    if h is not None:
-        tcs_pred.append(h)
-        tcs_top3.append(h)
-        confidence.append(1.0)
-        continue
+meta = {
+    "feature_cols": feature_cols,
+    "rf_params": RF_PARAMS,
+    "gyto_fallback": gyto_fallback,
+    "topk": {
+        "prefix2": TOPK_PREFIX2,
+        "prefix3": TOPK_PREFIX3,
+        "suffix2": TOPK_SUFFIX2,
+        "suffix3": TOPK_SUFFIX3,
+    },
+    "_note": "Fragments were capped with _OTHER_ before encoding; unseen tokens at inference should map to _OTHER_.",
+}
 
-    # Model path
-    x = row_vector(row)
-    probs = model.predict_proba(x)[0]
-    idx = np.argsort(probs)[::-1][:3]
-    labels = le_tcs.inverse_transform(idx)
-    tcs_pred.append(labels[0])
-    tcs_top3.append(", ".join(labels))
-    confidence.append(float(probs[idx[0]]))
+joblib.dump(model, ARTIFACTS_DIR / "model.joblib")
+joblib.dump(le_tcs, ARTIFACTS_DIR / "le_tcs.joblib")
+joblib.dump(le_gyto, ARTIFACTS_DIR / "le_gyto.joblib")
+joblib.dump(prefix2_encoder, ARTIFACTS_DIR / "le_prefix2.joblib")
+joblib.dump(prefix3_encoder, ARTIFACTS_DIR / "le_prefix3.joblib")
+joblib.dump(suffix2_encoder, ARTIFACTS_DIR / "le_suffix2.joblib")
+joblib.dump(suffix3_encoder, ARTIFACTS_DIR / "le_suffix3.joblib")
+joblib.dump(meta, ARTIFACTS_DIR / "meta.joblib")
 
-df_out = df_all.copy()
-df_out["tcs_pred"] = tcs_pred
-df_out["tcs_top3"] = tcs_top3
-df_out["confidence"] = confidence
-
-# --------------------------- Save Output ---------------------------
-print("🔹 Saving results…")
-df_out.to_csv(OUTPUT_FILE, index=False)
-print(f"🎉 Done. Wrote: {OUTPUT_FILE.resolve()}")
+print("✅ Artifacts saved under ./tcs_artifacts/")
